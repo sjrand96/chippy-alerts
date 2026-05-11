@@ -9,6 +9,7 @@ email alert if any new vehicles have appeared.
 import json
 import os
 import smtplib
+import argparse
 from email.message import EmailMessage
 
 import requests
@@ -36,12 +37,29 @@ MAX_DISTANCE_MILES = 750
 
 ORDER_STATUS_LABELS = {
     1: "At Dealership",
-    3: "In Production",
     4: "In Transit",
     5: "Arriving Soon",
 }
 
 VEHICLE_DETAIL_URL = "https://www.miniusa.com/inventory.html#/detail/{vin}"
+
+
+def load_env_file() -> None:
+    """Load environment variables from local .env file if present."""
+    env_file = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(env_file):
+        return
+
+    with open(env_file, "r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 
 def fetch_inventory() -> dict:
@@ -69,14 +87,23 @@ def parse_vehicles(data: dict) -> list[dict]:
         if center_id is None:
             continue
         sales = dealer.get("newVehicleSales") or []
-        if not sales:
+        if isinstance(sales, list):
+            if not sales:
+                continue
+            sale = sales[0]
+        elif isinstance(sales, dict):
+            sale = sales
+        else:
             continue
-        sale = sales[0]
+        if not isinstance(sale, dict):
+            continue
         try:
             distance = float(sale.get("distance", "0") or "0")
         except (ValueError, TypeError):
             distance = 0.0
         address = sale.get("address") or {}
+        if not isinstance(address, dict):
+            address = {}
         dealers[center_id] = {
             "dealerName": sale.get("dealerName", ""),
             "distance": distance,
@@ -92,14 +119,20 @@ def parse_vehicles(data: dict) -> list[dict]:
             continue
         if dealer["distance"] > MAX_DISTANCE_MILES:
             continue
-        status_code = vehicle.get("orderStatus")
+        raw_status_code = vehicle.get("orderStatus")
+        try:
+            status_code = int(raw_status_code)
+        except (ValueError, TypeError):
+            status_code = None
         vehicles.append(
             {
                 "vin": vehicle.get("vin", ""),
                 "name": vehicle.get("name", ""),
                 "totalMsrp": vehicle.get("totalMsrp"),
-                "orderStatus": status_code,
-                "orderStatusLabel": ORDER_STATUS_LABELS.get(status_code, str(status_code)),
+                "orderStatus": raw_status_code,
+                "orderStatusLabel": ORDER_STATUS_LABELS.get(
+                    status_code, str(raw_status_code)
+                ),
                 "dealerName": dealer["dealerName"],
                 "distance": dealer["distance"],
                 "city": dealer["city"],
@@ -125,20 +158,8 @@ def save_seen_vins(vins: set[str]) -> None:
         json.dump(sorted(vins), fh, indent=2)
 
 
-def send_alert(new_vehicles: list[dict]) -> None:
-    """Send an email alert listing each new vehicle."""
-    required = ("GMAIL_USER", "GMAIL_APP_PASSWORD", "ALERT_EMAIL")
-    missing = [var for var in required if not os.environ.get(var)]
-    if missing:
-        raise EnvironmentError(
-            f"Missing required environment variable(s): {', '.join(missing)}. "
-            "Set them as GitHub Actions secrets."
-        )
-
-    gmail_user = os.environ["GMAIL_USER"]
-    gmail_password = os.environ["GMAIL_APP_PASSWORD"]
-    alert_email = os.environ["ALERT_EMAIL"]
-
+def build_alert_email(new_vehicles: list[dict]) -> tuple[str, str]:
+    """Build the alert email subject and body."""
     count = len(new_vehicles)
     subject = f"New MINI JCW Alert — {count} new vehicle(s) found"
 
@@ -155,6 +176,24 @@ def send_alert(new_vehicles: list[dict]) -> None:
         )
 
     body = "\n".join(lines)
+    return subject, body
+
+
+def send_alert(new_vehicles: list[dict]) -> None:
+    """Send an email alert listing each new vehicle."""
+    required = ("GMAIL_USER", "GMAIL_APP_PASSWORD", "ALERT_EMAIL")
+    missing = [var for var in required if not os.environ.get(var)]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required environment variable(s): {', '.join(missing)}. "
+            "Set them as GitHub Actions secrets."
+        )
+
+    gmail_user = os.environ["GMAIL_USER"]
+    gmail_password = os.environ["GMAIL_APP_PASSWORD"]
+    alert_email = os.environ["ALERT_EMAIL"]
+
+    subject, body = build_alert_email(new_vehicles)
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -171,7 +210,19 @@ def send_alert(new_vehicles: list[dict]) -> None:
     print(f"Alert sent: {subject}")
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Scan MINI inventory and send alerts.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run scan and print alert content without sending email.",
+    )
+    return parser.parse_args()
+
+
+def main(dry_run: bool = False) -> None:
+    load_env_file()
     print("Fetching MINI USA inventory…")
     data = fetch_inventory()
 
@@ -184,8 +235,19 @@ def main() -> None:
     new_vehicles = [v for v in vehicles if v["vin"] in new_vins]
 
     if new_vehicles:
-        print(f"{len(new_vehicles)} new vehicle(s) detected. Sending alert…")
-        send_alert(new_vehicles)
+        if dry_run:
+            print(
+                f"{len(new_vehicles)} new vehicle(s) detected. Dry run enabled, "
+                "email not sent."
+            )
+            subject, body = build_alert_email(new_vehicles)
+            print("\n--- DRY RUN EMAIL PREVIEW ---")
+            print(f"Subject: {subject}\n")
+            print(body)
+            print("--- END PREVIEW ---\n")
+        else:
+            print(f"{len(new_vehicles)} new vehicle(s) detected. Sending alert…")
+            send_alert(new_vehicles)
     else:
         print("No new vehicles found. No alert sent.")
 
@@ -196,4 +258,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(dry_run=args.dry_run)
