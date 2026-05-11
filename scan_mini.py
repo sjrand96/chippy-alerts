@@ -127,6 +127,14 @@ def save_seen_vins(vins: set[str]) -> None:
 
 def send_alert(new_vehicles: list[dict]) -> None:
     """Send an email alert listing each new vehicle."""
+    required = ("GMAIL_USER", "GMAIL_APP_PASSWORD", "ALERT_EMAIL")
+    missing = [var for var in required if not os.environ.get(var)]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required environment variable(s): {', '.join(missing)}. "
+            "Set them as GitHub Actions secrets."
+        )
+
     gmail_user = os.environ["GMAIL_USER"]
     gmail_password = os.environ["GMAIL_APP_PASSWORD"]
     alert_email = os.environ["ALERT_EMAIL"]

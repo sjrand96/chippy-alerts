@@ -2,7 +2,7 @@ name: MINI Inventory Scan
 
 on:
   schedule:
-    # Daily at 15:00 UTC (08:00 Pacific)
+    # Daily at 15:00 UTC (08:00 PDT / 07:00 PST)
     - cron: "0 15 * * *"
   workflow_dispatch:
 
@@ -23,7 +23,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install -r requirements.txt
 
       - name: Run inventory scan
         env:
