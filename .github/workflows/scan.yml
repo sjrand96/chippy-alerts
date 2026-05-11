@@ -1,0 +1,45 @@
+name: MINI Inventory Scan
+
+on:
+  schedule:
+    # Daily at 15:00 UTC (08:00 Pacific)
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run inventory scan
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: python scan_mini.py
+
+      - name: Commit updated seen_vins.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_vins.json
+          if git diff --cached --quiet; then
+            echo "seen_vins.json unchanged — nothing to commit."
+          else
+            git commit -m "chore: update seen_vins.json [skip ci]"
+            git push
+          fi
