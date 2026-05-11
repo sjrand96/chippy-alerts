@@ -179,9 +179,20 @@ def build_alert_email(new_vehicles: list[dict]) -> tuple[str, str]:
     return subject, body
 
 
+def get_alert_recipients() -> list[str]:
+    """Read alert recipients from ALERT_EMAILS (or legacy ALERT_EMAIL)."""
+    recipients_raw = os.environ.get("ALERT_EMAILS") or os.environ.get("ALERT_EMAIL", "")
+    recipients = [
+        email.strip()
+        for email in recipients_raw.replace(";", ",").split(",")
+        if email.strip()
+    ]
+    return recipients
+
+
 def send_alert(new_vehicles: list[dict]) -> None:
     """Send an email alert listing each new vehicle."""
-    required = ("GMAIL_USER", "GMAIL_APP_PASSWORD", "ALERT_EMAIL")
+    required = ("GMAIL_USER", "GMAIL_APP_PASSWORD")
     missing = [var for var in required if not os.environ.get(var)]
     if missing:
         raise EnvironmentError(
@@ -191,21 +202,26 @@ def send_alert(new_vehicles: list[dict]) -> None:
 
     gmail_user = os.environ["GMAIL_USER"]
     gmail_password = os.environ["GMAIL_APP_PASSWORD"]
-    alert_email = os.environ["ALERT_EMAIL"]
+    recipients = get_alert_recipients()
+    if not recipients:
+        raise EnvironmentError(
+            "Missing alert recipient configuration. Set ALERT_EMAILS "
+            "(comma-separated) or ALERT_EMAIL."
+        )
 
     subject, body = build_alert_email(new_vehicles)
 
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = gmail_user
-    msg["To"] = alert_email
+    msg["To"] = ", ".join(recipients)
     msg.set_content(body)
 
     with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
         smtp.ehlo()
         smtp.starttls()
         smtp.login(gmail_user, gmail_password)
-        smtp.send_message(msg)
+        smtp.send_message(msg, to_addrs=recipients)
 
     print(f"Alert sent: {subject}")
 
@@ -241,7 +257,9 @@ def main(dry_run: bool = False) -> None:
                 "email not sent."
             )
             subject, body = build_alert_email(new_vehicles)
+            recipients = get_alert_recipients()
             print("\n--- DRY RUN EMAIL PREVIEW ---")
+            print(f"To: {', '.join(recipients) if recipients else '(not configured)'}")
             print(f"Subject: {subject}\n")
             print(body)
             print("--- END PREVIEW ---\n")
