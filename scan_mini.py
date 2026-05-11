@@ -161,9 +161,13 @@ def save_seen_vins(vins: set[str]) -> None:
 def build_alert_email(new_vehicles: list[dict]) -> tuple[str, str]:
     """Build the alert email subject and body."""
     count = len(new_vehicles)
-    subject = f"New MINI JCW Alert — {count} new vehicle(s) found"
+    subject = f"ChippyBot found {count} new Chippy Candidates"
 
-    lines = [f"Found {count} new MINI JCW vehicle(s) within {MAX_DISTANCE_MILES} miles:\n"]
+    lines = [
+        "Hi Bean,\n",
+        "ChippyBot has been busy scraping the web for suitable Chippies and is "
+        "pleased to let you know about these new ones:\n",
+    ]
     for v in new_vehicles:
         msrp = f"${v['totalMsrp']:,.0f}" if v["totalMsrp"] is not None else "N/A"
         lines.append(
