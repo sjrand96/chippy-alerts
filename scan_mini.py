@@ -2,8 +2,8 @@
 """
 MINI USA Inventory Scanner
 Polls the MINI USA inventory API for a specific vehicle configuration,
-compares results against a previously saved list of VINs, and sends an
-email alert if any new vehicles have appeared.
+compares results against saved VINs and last-known order status, and sends
+email alerts for new vehicles and for order-status changes on known VINs.
 """
 
 import json
@@ -19,18 +19,38 @@ API_URL = (
     "/v1/inventory-search-service/graphql"
 )
 
+# MINI USA inventory GraphQL: `agCode` is the BYO configuration id (e.g. 33GD).
+# `optionCodes` on each vehicle is used only for the email roof line (not to
+# filter inventory).
 GRAPHQL_QUERY = (
     'query inventory { getInventory( brand: MI zip: "94116" bucket: BYO '
     "filter: { locatorRange: 10000 excludeStopSale: true priceBlocked: false "
     'sold: false used: false serviceLoaner: false regions: ["E", "W", "C", "A"] '
     'priorities: ["2", "3", "4", "5"] paints: ["P0C6M"] agCode: "33GD" '
-    'options: ["S03B5"] minPrice: 0 } '
+    "minPrice: 0 } "
     "sorting: [{ order: ASC, criteria: DISTANCE_TO_LOCATOR_ZIP }] "
     "pagination: { pageIndex: 1, pageSize: 24 } "
     ") { numberOfFilteredVehicles dealerInfo { centerID newVehicleSales { "
     "dealerName distance address { city state } } } result { vin name "
-    "totalMsrp orderStatus dealerId } } }"
+    "totalMsrp orderStatus dealerId optionCodes } } }"
 )
+
+# SA code -> label from MINI USA inventory option names (first match wins).
+_ROOF_OPTION_LABELS: tuple[tuple[str, str], ...] = (
+    ("S03B5", "Black roof and mirror caps"),
+    ("S0381", "Roof in body color"),
+    ("S0382", "White roof and mirror caps"),
+    ("S03A3", "Chili red roof and mirror caps"),
+)
+
+
+def roof_label_from_option_codes(codes: frozenset[str] | set[str]) -> str:
+    """Human-readable roof line for the alert email; does not filter inventory."""
+    for code, label in _ROOF_OPTION_LABELS:
+        if code in codes:
+            return label
+    return "Roof style not listed (see MINI link)"
+
 
 SEEN_VINS_FILE = os.path.join(os.path.dirname(__file__), "seen_vins.json")
 MAX_DISTANCE_MILES = 750
@@ -119,6 +139,8 @@ def parse_vehicles(data: dict) -> list[dict]:
             continue
         if dealer["distance"] > MAX_DISTANCE_MILES:
             continue
+        codes = frozenset(vehicle.get("optionCodes") or [])
+        roof_label = roof_label_from_option_codes(codes)
         raw_status_code = vehicle.get("orderStatus")
         try:
             status_code = int(raw_status_code)
@@ -130,6 +152,7 @@ def parse_vehicles(data: dict) -> list[dict]:
                 "name": vehicle.get("name", ""),
                 "totalMsrp": vehicle.get("totalMsrp"),
                 "orderStatus": raw_status_code,
+                "orderStatusCode": status_code,
                 "orderStatusLabel": ORDER_STATUS_LABELS.get(
                     status_code, str(raw_status_code)
                 ),
@@ -138,46 +161,112 @@ def parse_vehicles(data: dict) -> list[dict]:
                 "city": dealer["city"],
                 "state": dealer["state"],
                 "url": VEHICLE_DETAIL_URL.format(vin=vehicle.get("vin", "")),
+                "roofLabel": roof_label,
             }
         )
     return vehicles
 
 
-def load_seen_vins() -> set[str]:
-    """Load the set of previously seen VINs from the state file."""
+def _dealer_location_suffix(v: dict) -> str:
+    city = (v.get("city") or "").strip()
+    state = (v.get("state") or "").strip()
+    if city and state:
+        return f" ({city}, {state})"
+    if city or state:
+        return f" ({city}{state})"
+    return ""
+
+
+def format_vehicle_block(v: dict, *, include_order_status: bool = True) -> str:
+    """Plain-text block for one vehicle (used in new-lead and status-update sections)."""
+    msrp = f"${v['totalMsrp']:,.0f}" if v["totalMsrp"] is not None else "N/A"
+    dealer_loc = _dealer_location_suffix(v)
+    lines = (
+        f"  Dealer:  {v['dealerName']}{dealer_loc}\n"
+        f"  Distance: {int(round(v['distance']))} miles\n"
+        f"  Vehicle: {v['name']}\n"
+        f"  VIN:     {v['vin']}\n"
+        f"  Roof:    {v['roofLabel']}\n"
+        f"  Price:   {msrp}\n"
+    )
+    if include_order_status:
+        lines += f"  Status:  {v['orderStatusLabel']}\n"
+    lines += f"  Link:    {v['url']}\n"
+    return lines
+
+
+def load_seen_state() -> dict[str, int | None]:
+    """
+    Load VIN -> last known numeric orderStatus from state file.
+    Legacy format was a JSON list of VINs only; those map to None until
+    the first post-migration scan records status (no retroactive change alerts).
+    """
     if not os.path.exists(SEEN_VINS_FILE):
-        return set()
+        return {}
     with open(SEEN_VINS_FILE, "r", encoding="utf-8") as fh:
         data = json.load(fh)
-    return set(data)
+    if isinstance(data, list):
+        return {str(vin): None for vin in data if vin}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, int | None] = {}
+    for vin, raw in data.items():
+        if not vin:
+            continue
+        if raw is None:
+            out[str(vin)] = None
+        else:
+            try:
+                out[str(vin)] = int(raw)
+            except (TypeError, ValueError):
+                out[str(vin)] = None
+    return out
 
 
-def save_seen_vins(vins: set[str]) -> None:
-    """Persist the updated set of seen VINs to the state file."""
+def save_seen_state(seen: dict[str, int | None]) -> None:
+    """Persist VIN -> orderStatus map (sorted keys for stable diffs)."""
+    serializable = {vin: seen[vin] for vin in sorted(seen.keys())}
     with open(SEEN_VINS_FILE, "w", encoding="utf-8") as fh:
-        json.dump(sorted(vins), fh, indent=2)
+        json.dump(serializable, fh, indent=2)
 
 
-def build_alert_email(new_vehicles: list[dict]) -> tuple[str, str]:
-    """Build the alert email subject and body."""
-    count = len(new_vehicles)
-    subject = f"ChippyBot found {count} new Chippy Candidates"
+def order_status_label_for_code(code: int | None) -> str:
+    if code is None:
+        return "Unknown"
+    return ORDER_STATUS_LABELS.get(code, str(code))
 
-    lines = [
-        "Hi Bean,\n",
-        "ChippyBot has been busy scraping the web for suitable Chippies and is "
-        "pleased to let you know about these new ones:\n",
-    ]
-    for v in new_vehicles:
-        msrp = f"${v['totalMsrp']:,.0f}" if v["totalMsrp"] is not None else "N/A"
-        lines.append(
-            f"  Dealer:  {v['dealerName']} ({v['city']}, {v['state']})\n"
-            f"  Distance: {v['distance']:.1f} miles\n"
-            f"  Vehicle: {v['name']}\n"
-            f"  Price:   {msrp}\n"
-            f"  Status:  {v['orderStatusLabel']}\n"
-            f"  Link:    {v['url']}\n"
-        )
+
+def build_alert_email(
+    new_vehicles: list[dict],
+    status_changes: list[dict],
+) -> tuple[str, str]:
+    """Build subject and body for new leads and/or status updates."""
+    subject_parts: list[str] = []
+    if new_vehicles:
+        subject_parts.append(f"{len(new_vehicles)} new lead(s)")
+    if status_changes:
+        subject_parts.append(f"{len(status_changes)} status update(s)")
+    subject = "ChippyBot: " + ", ".join(subject_parts)
+
+    lines = ["Hi Bean,\n", "ChippyBot inventory check:\n"]
+
+    if new_vehicles:
+        lines.append("New leads\n---------\n")
+        for v in new_vehicles:
+            lines.append(format_vehicle_block(v, include_order_status=True))
+
+    if new_vehicles and status_changes:
+        lines.append("")
+
+    if status_changes:
+        lines.append("Status updates\n----------------\n")
+        for ch in status_changes:
+            v = ch["vehicle"]
+            lines.append(format_vehicle_block(v, include_order_status=False))
+            lines.append(
+                f"  Was:     {ch['old_label']}\n"
+                f"  Now:     {ch['new_label']}\n"
+            )
 
     body = "\n".join(lines)
     return subject, body
@@ -194,8 +283,8 @@ def get_alert_recipients() -> list[str]:
     return recipients
 
 
-def send_alert(new_vehicles: list[dict]) -> None:
-    """Send an email alert listing each new vehicle."""
+def send_alert(new_vehicles: list[dict], status_changes: list[dict]) -> None:
+    """Send an email alert for new leads and/or status updates."""
     required = ("GMAIL_USER", "GMAIL_APP_PASSWORD")
     missing = [var for var in required if not os.environ.get(var)]
     if missing:
@@ -213,7 +302,7 @@ def send_alert(new_vehicles: list[dict]) -> None:
             "(comma-separated) or ALERT_EMAIL."
         )
 
-    subject, body = build_alert_email(new_vehicles)
+    subject, body = build_alert_email(new_vehicles, status_changes)
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -250,17 +339,38 @@ def main(dry_run: bool = False) -> None:
     current_vins = {v["vin"] for v in vehicles}
     print(f"Found {len(current_vins)} vehicle(s) within {MAX_DISTANCE_MILES} miles.")
 
-    seen_vins = load_seen_vins()
-    new_vins = current_vins - seen_vins
-    new_vehicles = [v for v in vehicles if v["vin"] in new_vins]
+    seen_state = load_seen_state()
 
-    if new_vehicles:
+    new_vehicles: list[dict] = []
+    status_changes: list[dict] = []
+
+    for v in vehicles:
+        vin = v["vin"]
+        code = v.get("orderStatusCode")
+        if vin not in seen_state:
+            new_vehicles.append(v)
+            continue
+        old_code = seen_state[vin]
+        if (
+            old_code is not None
+            and code is not None
+            and old_code != code
+        ):
+            status_changes.append(
+                {
+                    "vehicle": v,
+                    "old_label": order_status_label_for_code(old_code),
+                    "new_label": v["orderStatusLabel"],
+                }
+            )
+
+    if new_vehicles or status_changes:
         if dry_run:
             print(
-                f"{len(new_vehicles)} new vehicle(s) detected. Dry run enabled, "
-                "email not sent."
+                f"{len(new_vehicles)} new lead(s), {len(status_changes)} status update(s). "
+                "Dry run enabled, email not sent."
             )
-            subject, body = build_alert_email(new_vehicles)
+            subject, body = build_alert_email(new_vehicles, status_changes)
             recipients = get_alert_recipients()
             print("\n--- DRY RUN EMAIL PREVIEW ---")
             print(f"To: {', '.join(recipients) if recipients else '(not configured)'}")
@@ -268,14 +378,18 @@ def main(dry_run: bool = False) -> None:
             print(body)
             print("--- END PREVIEW ---\n")
         else:
-            print(f"{len(new_vehicles)} new vehicle(s) detected. Sending alert…")
-            send_alert(new_vehicles)
+            print(
+                f"{len(new_vehicles)} new lead(s), {len(status_changes)} status update(s). "
+                "Sending alert…"
+            )
+            send_alert(new_vehicles, status_changes)
     else:
-        print("No new vehicles found. No alert sent.")
+        print("No new leads or status changes. No alert sent.")
 
-    # Update state: union of seen and current (removals are ignored)
-    updated_vins = seen_vins | current_vins
-    save_seen_vins(updated_vins)
+    updated_state = dict(seen_state)
+    for v in vehicles:
+        updated_state[v["vin"]] = v.get("orderStatusCode")
+    save_seen_state(updated_state)
     print("State file updated.")
 
 
