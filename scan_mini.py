@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MINI USA Inventory Scanner
-Polls the MINI USA inventory API for a specific vehicle configuration,
+Polls the MINI USA inventory API for a specific vehicle configuration (yellow and chippy colored cors),
 compares results against saved VINs and last-known order status, and sends
 email alerts for new vehicles and for order-status changes on known VINs.
 """
