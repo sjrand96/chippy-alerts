@@ -20,13 +20,21 @@ API_URL = (
 )
 
 # MINI USA inventory GraphQL: `agCode` is the BYO configuration id (e.g. 33GD).
-# `optionCodes` on each vehicle is used only for the email roof line (not to
-# filter inventory).
+# `paints` accepts multiple codes (OR). `optionCodes` on each vehicle is used for
+# email color/roof lines only (not to filter inventory).
+PAINT_CODES: tuple[str, ...] = ("P0C6M", "P0C6N")
+
+_PAINT_OPTION_LABELS: dict[str, str] = {
+    "P0C6M": "Ocean Wave Green Metallic",
+    "P0C6N": "Sunny Side Yellow",
+}
+
 GRAPHQL_QUERY = (
     'query inventory { getInventory( brand: MI zip: "94116" bucket: BYO '
     "filter: { locatorRange: 10000 excludeStopSale: true priceBlocked: false "
     'sold: false used: false serviceLoaner: false regions: ["E", "W", "C", "A"] '
-    'priorities: ["2", "3", "4", "5"] paints: ["P0C6M"] agCode: "33GD" '
+    f'priorities: ["2", "3", "4", "5"] paints: {json.dumps(list(PAINT_CODES))} '
+    'agCode: "33GD" '
     "minPrice: 0 } "
     "sorting: [{ order: ASC, criteria: DISTANCE_TO_LOCATOR_ZIP }] "
     "pagination: { pageIndex: 1, pageSize: 24 } "
@@ -42,6 +50,17 @@ _ROOF_OPTION_LABELS: tuple[tuple[str, str], ...] = (
     ("S0382", "White roof and mirror caps"),
     ("S03A3", "Chili red roof and mirror caps"),
 )
+
+
+def paint_label_from_option_codes(codes: frozenset[str] | set[str]) -> str:
+    """Human-readable exterior color for the alert email."""
+    for code in PAINT_CODES:
+        if code in codes:
+            return _PAINT_OPTION_LABELS[code]
+    for code in codes:
+        if code.startswith("P0"):
+            return _PAINT_OPTION_LABELS.get(code, code)
+    return "Color not listed (see MINI link)"
 
 
 def roof_label_from_option_codes(codes: frozenset[str] | set[str]) -> str:
@@ -140,6 +159,7 @@ def parse_vehicles(data: dict) -> list[dict]:
         if dealer["distance"] > MAX_DISTANCE_MILES:
             continue
         codes = frozenset(vehicle.get("optionCodes") or [])
+        paint_label = paint_label_from_option_codes(codes)
         roof_label = roof_label_from_option_codes(codes)
         raw_status_code = vehicle.get("orderStatus")
         try:
@@ -161,6 +181,7 @@ def parse_vehicles(data: dict) -> list[dict]:
                 "city": dealer["city"],
                 "state": dealer["state"],
                 "url": VEHICLE_DETAIL_URL.format(vin=vehicle.get("vin", "")),
+                "paintLabel": paint_label,
                 "roofLabel": roof_label,
             }
         )
@@ -186,6 +207,7 @@ def format_vehicle_block(v: dict, *, include_order_status: bool = True) -> str:
         f"  Distance: {int(round(v['distance']))} miles\n"
         f"  Vehicle: {v['name']}\n"
         f"  VIN:     {v['vin']}\n"
+        f"  Color:   {v['paintLabel']}\n"
         f"  Roof:    {v['roofLabel']}\n"
         f"  Price:   {msrp}\n"
     )
@@ -332,7 +354,8 @@ def parse_args() -> argparse.Namespace:
 
 def main(dry_run: bool = False) -> None:
     load_env_file()
-    print("Fetching MINI USA inventory…")
+    paint_names = ", ".join(_PAINT_OPTION_LABELS[c] for c in PAINT_CODES)
+    print(f"Fetching MINI USA inventory ({paint_names})…")
     data = fetch_inventory()
 
     vehicles = parse_vehicles(data)
